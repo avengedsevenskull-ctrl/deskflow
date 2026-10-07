@@ -29,8 +29,10 @@
 #include <unistd.h>
 #include <vector>
 
-// Values are in fractional wheel-click units (1.0 == one full 120-unit click) for trackpad
-// and pixels in scroll wheel events.
+// Values are in wheel units (120 units == one full wheel click) for both smooth
+// and discrete input. Smooth input is converted from pixels at 12 units per
+// pixel (10 px == 1 click); the remainder keeps sub-unit precision so nothing is
+// lost between events.
 struct ScrollRemainder
 {
   double x;
@@ -371,11 +373,40 @@ void EiComputer::fakeMouseWheel(ScrollDelta delta) const
     return;
 
   delta = applyScrollModifier(delta);
+
+  // Split the delta into whole wheel clicks and a sub-click remainder.
+  //
+  // Whole clicks keep using the discrete channel (crisp wheel feel; libei and
+  // the compositor emulate pixel scrolling from them). The remainder is carried
+  // between events and, when no whole click is due, forwarded on the continuous
+  // channel so the portal can inject smooth wl_pointer.axis scrolling. libei
+  // forbids mixing discrete and continuous scroll for one input event, so a
+  // single event always takes exactly one of the two channels.
+  //
+  // Unit conventions: 120 units == one wheel click; smooth input is 10 px ==
+  // one click, so 12 units == one pixel.
+  constexpr double s_unitsPerPixel = 12.0;
+
+  const std::int32_t ax = m_smoothRemainderX + delta.x;
+  const std::int32_t ay = m_smoothRemainderY + delta.y;
+  const std::int32_t wholeX = ax / s_scrollDelta; // truncates toward zero
+  const std::int32_t wholeY = ay / s_scrollDelta;
+
   // libei and deskflow seem to use opposite directions, so we have
   // to send EI the opposite of the value received if we want to remain
   // compatible with other platforms (including X11).
   ensureEmulating();
-  ei_device_scroll_discrete(m_eiPointer, -delta.x, -delta.y);
+
+  if (wholeX != 0 || wholeY != 0) {
+    m_smoothRemainderX = ax - wholeX * s_scrollDelta;
+    m_smoothRemainderY = ay - wholeY * s_scrollDelta;
+    ei_device_scroll_discrete(m_eiPointer, -wholeX * s_scrollDelta, -wholeY * s_scrollDelta);
+  } else {
+    m_smoothRemainderX = 0;
+    m_smoothRemainderY = 0;
+    ei_device_scroll_delta(m_eiPointer, -ax / s_unitsPerPixel, -ay / s_unitsPerPixel);
+  }
+
   ei_device_frame(m_eiPointer, ei_now(m_ei));
 }
 
@@ -809,12 +840,13 @@ void EiComputer::onButtonEvent(ei_event *event)
 
 void EiComputer::onPointerScrollEvent(ei_event *event)
 {
-  // Smooth scroll deltas are in pixels. We accumulate them as fractional
-  // wheel-click units and only send full wheel clicks (120 units each)
-  // to the client. Sub-120 fractional clicks are silently ignored by
-  // compositors on the receiving end, so accumulating full clicks avoids
-  // flooding the network with events that the client drops anyway.
-  static const double s_wheelClicksPerPixel = 0.1; // 10 pixels == 1 full wheel click
+  // Smooth scroll deltas arrive in pixels. Deskflow wheel units are 120 per
+  // click and the historical convention is 10 px == 1 click, so one pixel is
+  // 12 units. We keep sub-unit precision in the remainder and forward the
+  // fractional units as-is: fleet clients map sub-click remainders onto the
+  // continuous (wl_pointer.axis) channel, which is what makes touchpad and
+  // hi-res wheel input scroll smoothly on the receiving end.
+  static constexpr double s_unitsPerPixel = 12.0; // 10 px == 120 units
 
   assert(m_isPrimary);
 
@@ -830,31 +862,25 @@ void EiComputer::onPointerScrollEvent(ei_event *event)
     ei_device_set_user_data(device, remainder);
   }
 
-  // Accumulate smooth scroll as fractional wheel clicks (1.0 == 120 units)
-  double accX = remainder->x + dx * s_wheelClicksPerPixel;
-  double accY = remainder->y + dy * s_wheelClicksPerPixel;
+  const double unitsX = remainder->x + dx * s_unitsPerPixel;
+  const double unitsY = remainder->y + dy * s_unitsPerPixel;
 
-  // Only dispatch full wheel clicks. Use trunc (toward zero) not floor,
-  // because floor(-0.3) == -1 which would fire a spurious click.
-  double fullClicksX = std::trunc(accX);
-  double fullClicksY = std::trunc(accY);
+  // Dispatch whole units; truncate toward zero so negative scroll does not gain
+  // a spurious unit. The fractional remainder is carried over to the next event.
+  const auto ux = static_cast<std::int32_t>(std::trunc(unitsX));
+  const auto uy = static_cast<std::int32_t>(std::trunc(unitsY));
+  remainder->x = unitsX - ux;
+  remainder->y = unitsY - uy;
+
+  // Wheel units are packed as signed 16-bit on the wire; clamp defensively.
+  const auto clampUnits = [](std::int32_t v) { return std::clamp(v, -32768, 32767); };
 
   // libei and deskflow seem to use opposite directions, so we have
   // to send the opposite of the value reported by EI if we want to
   // remain compatible with other platforms (including X11).
-  if (fullClicksX != 0 || fullClicksY != 0) {
-    sendEvent(
-        EventTypes::PrimaryComputerWheel,
-        WheelInfo::alloc(
-            static_cast<int32_t>(-fullClicksX) * s_scrollDelta, static_cast<int32_t>(-fullClicksY) * s_scrollDelta
-        )
-    );
-    accX -= fullClicksX;
-    accY -= fullClicksY;
+  if (ux != 0 || uy != 0) {
+    sendEvent(EventTypes::PrimaryComputerWheel, WheelInfo::alloc(clampUnits(-ux), clampUnits(-uy)));
   }
-
-  remainder->x = accX;
-  remainder->y = accY;
 }
 
 void EiComputer::onPointerScrollDiscreteEvent(ei_event *event)

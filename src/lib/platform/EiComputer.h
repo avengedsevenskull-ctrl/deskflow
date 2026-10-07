@@ -176,6 +176,11 @@ private:
   static constexpr double s_idleEmulationTimeout = 4.0;
 
   std::uint32_t m_activeSides = 0;
+
+  // Client role: sub-click scroll remainder in 120-unit wheel units, carried
+  // between events so it can be flushed on the continuous scroll channel.
+  mutable std::int32_t m_smoothRemainderX = 0;
+  mutable std::int32_t m_smoothRemainderY = 0;
   std::uint32_t m_x = 0;
   std::uint32_t m_y = 0;
   std::uint32_t m_w = 0;
