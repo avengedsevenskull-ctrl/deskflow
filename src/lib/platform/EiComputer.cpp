@@ -404,7 +404,10 @@ void EiComputer::fakeMouseWheel(ScrollDelta delta) const
   } else {
     m_smoothRemainderX = 0;
     m_smoothRemainderY = 0;
-    ei_device_scroll_delta(m_eiPointer, -ax / s_unitsPerPixel, -ay / s_unitsPerPixel);
+    // Calibrated against the discrete path: libei's continuous scroll sign is
+    // opposite to its discrete sign for the same physical direction, so the
+    // negation used for ei_device_scroll_discrete must not be applied here.
+    ei_device_scroll_delta(m_eiPointer, ax / s_unitsPerPixel, ay / s_unitsPerPixel);
   }
 
   ei_device_frame(m_eiPointer, ei_now(m_ei));
